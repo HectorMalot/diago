@@ -128,7 +128,6 @@ type MediaSession struct {
 	localCtxSRTP  *srtp.Context
 	remoteCtxSRTP *srtp.Context
 	srtpRemoteTag int
-	hasRemoteSDP  bool
 
 	// RTP NAT enables handling RTP behind NAT. Checkout also RTPSourceLock
 	RTPNAT          int // 0 - disabled, 1 - Learn source change (RTP Symetric)
@@ -325,7 +324,7 @@ func (s *MediaSession) LocalSDP() []byte {
 	if s.SecureRTP == 1 {
 		// RFC 4568/8643: only include crypto when offering (no remote SDP yet)
 		// or when the peer actually offered SRTP
-		if !s.hasRemoteSDP || s.remoteCtxSRTP != nil {
+		if s.Raddr.IP == nil || s.remoteCtxSRTP != nil {
 			err := func() error {
 				// TODO detect algorithm
 				profile := srtp.ProtectionProfile(s.SRTPAlg)
@@ -426,8 +425,6 @@ func (s *MediaSession) LocalSDP() []byte {
 // NOTE: It must called ONCE or single thread while negotiation happening.
 // For multi negotiation Fork Must be called before
 func (s *MediaSession) RemoteSDP(sdpReceived []byte) error {
-	s.hasRemoteSDP = true
-
 	sd := sdp.SessionDescription{}
 	if err := sdp.Unmarshal(sdpReceived, &sd); err != nil {
 		return fmt.Errorf("fail to parse received SDP: %w", err)
