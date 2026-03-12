@@ -134,6 +134,9 @@ type MediaSession struct {
 	// ReadRTPFromAddr is set after Read operation. NOT THREAD SAFE and should be only used together with Read
 	// It can be used to validate source of RTP packet
 	ReadRTPFromAddr net.Addr
+	// remoteProto is the media protocol from the remote SDP offer (e.g. "RTP/AVP", "RTP/SAVP")
+	remoteProto string
+
 	// DTLS
 	dtlsConn *dtls.Conn
 
@@ -351,7 +354,8 @@ func (s *MediaSession) LocalSDP() []byte {
 				}
 
 				// NOTE: For some compatibility reasons (like asterisk) it would be required that this stays on RTP/AVP
-				if !RTPProfileSAVPDisable {
+				// When the remote offer uses RTP/SAVP, we must mirror it per RFC 3264
+				if !RTPProfileSAVPDisable || s.remoteProto == "RTP/SAVP" {
 					rtpProfile = "RTP/SAVP"
 				}
 				return nil
@@ -451,6 +455,7 @@ func (s *MediaSession) RemoteSDP(sdpReceived []byte) error {
 	default:
 		return fmt.Errorf("unsupported media description protocol proto=%s", md.Proto)
 	}
+	s.remoteProto = md.Proto
 
 	codecs := make([]Codec, len(md.Formats))
 	attrs := sd.Values("a")
