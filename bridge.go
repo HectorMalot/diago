@@ -144,8 +144,11 @@ func (b *Bridge) ProxyMedia() error {
 		return fmt.Errorf("you are already running proxy media. Increase WaitDialogsNum")
 	}
 
+	// Clear any stale write deadlines before starting the proxy.
+	// The auto-start path (AddDialogSession with WaitDialogsNum=2) does not
+	// set write deadlines, so explicit ProxyMedia should not either.
 	for _, d := range b.dialogs {
-		d.Media().mediaSession.StopRTP(2, 0)
+		d.Media().mediaSession.StartRTP(2)
 	}
 	return b.proxyMedia()
 }

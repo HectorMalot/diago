@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"net"
 	"testing"
 	"time"
 
@@ -65,6 +66,59 @@ func TestBridgeProxy(t *testing.T) {
 	require.ErrorIs(t, err, io.EOF)
 
 	// Confirm all data is proxied
+	assert.Equal(t, 9999, incoming.audioWriter.(*bytes.Buffer).Len())
+	assert.Equal(t, 9999, outgoing.audioWriter.(*bytes.Buffer).Len())
+}
+
+func TestBridgeExplicitProxyMedia(t *testing.T) {
+	// Create UDP listeners so that StartRTP(2) can clear write deadlines.
+	// ProxyMedia() calls StartRTP to reset stale deadlines before proxying.
+	rtpConn1, err := net.ListenPacket("udp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer rtpConn1.Close()
+	rtpConn2, err := net.ListenPacket("udp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer rtpConn2.Close()
+
+	dummyAddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0}
+	ms1 := &media.MediaSession{Codecs: []media.Codec{media.CodecAudioAlaw}}
+	ms1.InitWithListeners(rtpConn1, rtpConn1, dummyAddr)
+	ms2 := &media.MediaSession{Codecs: []media.Codec{media.CodecAudioAlaw}}
+	ms2.InitWithListeners(rtpConn2, rtpConn2, dummyAddr)
+
+	b := NewBridge()
+	b.WaitDialogsNum = 99 // Prevent auto-start so we call ProxyMedia() explicitly
+
+	incoming := &DialogServerSession{
+		DialogMedia: DialogMedia{
+			mediaSession: ms1,
+			audioReader:  bytes.NewBuffer(make([]byte, 9999)),
+			audioWriter:  bytes.NewBuffer(make([]byte, 0)),
+			RTPPacketReader: media.NewRTPPacketReader(nil, media.CodecAudioAlaw),
+			RTPPacketWriter: media.NewRTPPacketWriter(nil, media.CodecAudioAlaw),
+		},
+	}
+	outgoing := &DialogClientSession{
+		DialogMedia: DialogMedia{
+			mediaSession: ms2,
+			audioReader:  bytes.NewBuffer(make([]byte, 9999)),
+			audioWriter:  bytes.NewBuffer(make([]byte, 0)),
+			RTPPacketReader: media.NewRTPPacketReader(nil, media.CodecAudioAlaw),
+			RTPPacketWriter: media.NewRTPPacketWriter(nil, media.CodecAudioAlaw),
+		},
+	}
+
+	err = b.AddDialogSession(incoming)
+	require.NoError(t, err)
+	err = b.AddDialogSession(outgoing)
+	require.NoError(t, err)
+
+	// This is the explicit/manual path used after attended INVITE transfer.
+	// Previously this failed immediately because StopRTP(2, 0) expired write deadlines.
+	err = b.ProxyMedia()
+	require.ErrorIs(t, err, io.EOF)
+
+	// Confirm all data is proxied in both directions
 	assert.Equal(t, 9999, incoming.audioWriter.(*bytes.Buffer).Len())
 	assert.Equal(t, 9999, outgoing.audioWriter.(*bytes.Buffer).Len())
 }
