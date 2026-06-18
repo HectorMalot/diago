@@ -34,22 +34,29 @@ func rtpUnmarshalPayload(n int, buf []byte, p *rtp.Packet) error {
 	if p.Header.Padding {
 		p.PaddingSize = buf[end-1]
 		end -= int(p.PaddingSize)
+	} else {
+		// p is reused across reads (RTPPacketReader.packet). pion's full
+		// Unmarshal resets PaddingSize when a packet has no padding; this
+		// optimized path must do the same, otherwise a stale PaddingSize from
+		// an earlier padded packet corrupts the reader's payload-size invariant.
+		p.PaddingSize = 0
 	}
 	if end < n {
 		return io.ErrShortBuffer
 	}
 
-	// If Payload buffer exists try to fill it and allow buffer reusage
-	if p.Payload != nil && len(p.Payload) >= len(buf[n:end]) {
-		copy(p.Payload, buf[n:end])
-		return nil
+	payload := buf[n:end]
+	// p is reused across reads, so the length of p.Payload must be reset to THIS
+	// packet's payload length. Reslicing (not just copying into a leftover larger
+	// slice) is required: copying 4 DTMF bytes into a 160-byte audio buffer while
+	// leaving len(p.Payload)==160 makes len(p.Payload) disagree with the real
+	// payload size, which the reader's "payload calc" invariant then panics on.
+	if cap(p.Payload) >= len(payload) {
+		p.Payload = p.Payload[:len(payload)]
+	} else {
+		p.Payload = make([]byte, len(payload))
 	}
-
-	// This creates allocations
-	// Payload should be recreated instead referenced
-	// This allows buf reusage
-	p.Payload = make([]byte, len(buf[n:end]))
-	copy(p.Payload, buf[n:end])
+	copy(p.Payload, payload)
 	return nil
 }
 
