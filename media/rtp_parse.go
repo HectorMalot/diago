@@ -22,13 +22,14 @@ func RTPUnmarshal(buf []byte, p *rtp.Packet) error {
 }
 
 func rtpUnmarshalPayload(n int, buf []byte, p *rtp.Packet) error {
-	if p.Header.Extension {
-		// For now eliminate it as it holds reference on buffer
-		// TODO fix this
-		p.Header.Extensions = nil
-		p.Header.Extension = false
-	}
-
+	// NOTE: n is the header size including any RTP header extension (it is
+	// derived from pkt.Header.MarshalSize() by the caller). The header has
+	// already been fully parsed (e.g. by srtp DecryptRTP), so the extension
+	// must be kept intact: it keeps Header.MarshalSize() consistent with the
+	// payload offset used below, which the reader's invariant check relies on.
+	// The extension does reference the read buffer, but so does the plain
+	// pion Unmarshal path, and no code reads Header.Extensions after parsing,
+	// so keeping it is consistent and safe.
 	end := len(buf)
 	if p.Header.Padding {
 		p.PaddingSize = buf[end-1]
