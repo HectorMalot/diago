@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -353,6 +354,85 @@ func TestRTPSessionCloseWaitsForMonitor(t *testing.T) {
 		require.NoError(t, err)
 	case <-time.After(time.Second):
 		t.Fatal("Close did not return after the RTCP monitor exited")
+	}
+}
+
+func TestRTPSessionOnReadRTCPConcurrentUpdate(t *testing.T) {
+	rtpSession := &RTPSession{}
+	callbackA := func(rtcp.Packet, RTPReadStats) {}
+	callbackB := func(rtcp.Packet, RTPReadStats) {}
+	rtpSession.OnReadRTCP(callbackA)
+	report := &rtcp.ReceiverReport{SSRC: 0x87654321}
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		<-start
+		for range 10_000 {
+			rtpSession.OnReadRTCP(callbackA)
+			rtpSession.OnReadRTCP(callbackB)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		<-start
+		for range 10_000 {
+			rtpSession.readRTCPPacket(report)
+		}
+	}()
+
+	close(start)
+	wg.Wait()
+}
+
+func TestRTPSessionOnWriteRTCPConcurrentUpdate(t *testing.T) {
+	rtpSession := fakeSession(9876, 1234, nil, io.Discard, nil, io.Discard)
+	rtpSession.writeStats = RTPWriteStats{
+		SSRC:                0x12345678,
+		lastPacketTime:      time.Now(),
+		lastPacketTimestamp: 160,
+		sampleRate:          8000,
+		PacketsCount:        1,
+		OctetCount:          160,
+	}
+	callbackA := func(rtcp.Packet, RTPWriteStats) {}
+	callbackB := func(rtcp.Packet, RTPWriteStats) {}
+	rtpSession.OnWriteRTCP(callbackA)
+
+	start := make(chan struct{})
+	errs := make(chan error, 1)
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		<-start
+		for range 10_000 {
+			rtpSession.OnWriteRTCP(callbackA)
+			rtpSession.OnWriteRTCP(callbackB)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		<-start
+		for range 10_000 {
+			if err := rtpSession.writeRTCP(time.Now()); err != nil {
+				select {
+				case errs <- err:
+				default:
+				}
+				return
+			}
+		}
+	}()
+
+	close(start)
+	wg.Wait()
+	select {
+	case err := <-errs:
+		require.NoError(t, err)
+	default:
 	}
 }
 
