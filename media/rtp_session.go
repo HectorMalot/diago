@@ -48,7 +48,7 @@ type RTPSession struct {
 	lifecycleMU    sync.Mutex
 	rtcpTicker     *time.Ticker
 	rtcpClosed     chan struct{}
-	monitorWG      sync.WaitGroup
+	rtcpIOWG       sync.WaitGroup
 	monitorStarted bool
 	closed         bool
 	closeOnce      sync.Once
@@ -168,12 +168,12 @@ func (s *RTPSession) Close() error {
 		close(s.rtcpClosed)
 		s.rtcpTicker.Stop()
 		conn := s.Sess.rtcpConn
-		s.lifecycleMU.Unlock()
-
 		if conn != nil {
 			s.closeErr = conn.SetReadDeadline(time.Now())
 		}
-		s.monitorWG.Wait()
+		s.lifecycleMU.Unlock()
+
+		s.rtcpIOWG.Wait()
 	})
 	return s.closeErr
 }
@@ -386,12 +386,10 @@ func (s *RTPSession) Monitor() error {
 		return err
 	}
 	go func() {
-		defer s.monitorWG.Done()
 		errchan <- s.readRTCP()
 	}()
 	s.lifecycleMU.Unlock()
 
-	defer s.monitorWG.Done()
 	var err error
 	for {
 		var now time.Time
@@ -425,7 +423,6 @@ func (s *RTPSession) MonitorBackground() error {
 		return err
 	}
 	go func() {
-		defer s.monitorWG.Done()
 		sess := s.Sess
 		log.Debug("RTCP reader started", "laddr", sess.rtcpConn.LocalAddr().String())
 		if err := s.readRTCP(); err != nil {
@@ -445,7 +442,6 @@ func (s *RTPSession) MonitorBackground() error {
 	}()
 
 	go func() {
-		defer s.monitorWG.Done()
 		sess := s.Sess
 		log.Debug("RTCP writer started", "raddr", sess.rtcpRaddr.String())
 		for {
@@ -483,8 +479,20 @@ func (s *RTPSession) startMonitorUnsafe() error {
 	}
 
 	s.monitorStarted = true
-	s.monitorWG.Add(2)
 	return nil
+}
+
+// Callbacks intentionally run outside this barrier because they may close the session or enter dialog locks.
+// Close only needs the shared socket to be idle before its connection can be handed to a replacement session.
+func (s *RTPSession) beginRTCPIO() bool {
+	s.lifecycleMU.Lock()
+	defer s.lifecycleMU.Unlock()
+	if s.closed {
+		return false
+	}
+
+	s.rtcpIOWG.Add(1)
+	return true
 }
 
 func (s *RTPSession) readRTCP() error {
@@ -493,7 +501,11 @@ func (s *RTPSession) readRTCP() error {
 	buf := make([]byte, 1600)
 	rtcpBuf := make([]rtcp.Packet, 5) // What would be more correct value?
 	for {
+		if !s.beginRTCPIO() {
+			return net.ErrClosed
+		}
 		n, err := sess.ReadRTCP(buf, rtcpBuf)
+		s.rtcpIOWG.Done()
 		if err != nil {
 			if errors.Is(err, errRTCPFailedToUnmarshal) {
 				DefaultLogger().Error("RTCP Unmarshal error. Continue listen", "error", err)
@@ -608,6 +620,10 @@ func (s *RTPSession) writeRTCP(now time.Time) error {
 		s.rtcpMU.Unlock()
 	}
 
+	if !s.beginRTCPIO() {
+		return net.ErrClosed
+	}
+	defer s.rtcpIOWG.Done()
 	return s.Sess.WriteRTCP(pkt)
 }
 
