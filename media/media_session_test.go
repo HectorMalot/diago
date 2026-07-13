@@ -18,8 +18,16 @@ import (
 )
 
 func TestMediaPortRange(t *testing.T) {
+	portStart, portEnd := RTPPortStart, RTPPortEnd
+	portOffset := rtpPortOffset.Load()
+	t.Cleanup(func() {
+		RTPPortStart, RTPPortEnd = portStart, portEnd
+		rtpPortOffset.Store(portOffset)
+	})
+
 	RTPPortStart = 5000
 	RTPPortEnd = 5010
+	rtpPortOffset.Store(0)
 
 	sessions := []*MediaSession{}
 	for i := RTPPortStart; i < RTPPortEnd; i += 2 {

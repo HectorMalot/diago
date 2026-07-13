@@ -161,6 +161,10 @@ func NewRTPSession(sess *MediaSession) *RTPSession {
 	}
 }
 
+// Close stops RTCP monitoring and waits for active socket I/O to return.
+// Callbacks may call Close because callback execution is not part of that wait.
+// If the media session has been forked, Close must return before monitoring starts
+// on the successor because both sessions share the same packet connections.
 func (s *RTPSession) Close() error {
 	s.closeOnce.Do(func() {
 		s.lifecycleMU.Lock()
@@ -169,7 +173,9 @@ func (s *RTPSession) Close() error {
 		s.rtcpTicker.Stop()
 		conn := s.Sess.rtcpConn
 		if conn != nil {
-			s.closeErr = conn.SetReadDeadline(time.Now())
+			// Forked sessions share this connection. Interrupt all blocked I/O so the
+			// predecessor is quiescent before a successor clears the deadline.
+			s.closeErr = conn.SetDeadline(time.Now())
 		}
 		s.lifecycleMU.Unlock()
 
@@ -373,7 +379,9 @@ func (s *RTPSession) WriteStats() RTPWriteStats {
 	return s.writeStats
 }
 
-// Monitor starts reading RTCP and monitoring media quality
+// Monitor starts reading RTCP and monitoring media quality in the caller's goroutine.
+// Each RTPSession may be monitored only once. For a forked media session, the
+// predecessor RTPSession's Close must return before Monitor starts.
 func (s *RTPSession) Monitor() error {
 	if s.Sess.Raddr.IP == nil || s.Sess.rtcpRaddr.IP == nil {
 		return fmt.Errorf("raddr of RTP is not present. You must call this after RemoteSDP is parsed")
@@ -403,14 +411,31 @@ func (s *RTPSession) Monitor() error {
 			break
 		}
 	}
-	if deadlineErr := s.Sess.rtcpConn.SetReadDeadline(time.Now()); deadlineErr != nil {
-		err = errors.Join(err, deadlineErr)
+	s.lifecycleMU.Lock()
+	closed := s.closed
+	if !closed {
+		// The reader needs a wake-up when the writer fails, but a retired session
+		// must never overwrite the deadline cleared by its forked successor.
+		if deadlineErr := s.Sess.rtcpConn.SetReadDeadline(time.Now()); deadlineErr != nil {
+			err = errors.Join(err, deadlineErr)
+		}
 	}
-	return errors.Join(err, <-errchan)
+	s.lifecycleMU.Unlock()
+
+	readErr := <-errchan
+	if closed && errors.Is(err, net.ErrClosed) {
+		var netErr net.Error
+		if errors.Is(readErr, io.EOF) || errors.Is(readErr, net.ErrClosed) ||
+			errors.As(readErr, &netErr) && netErr.Timeout() {
+			return nil
+		}
+	}
+	return errors.Join(err, readErr)
 }
 
-// MonitorBackground is helper to keep monitoring in background
-// MUST Be called after session REMOTE SDP is parsed
+// MonitorBackground starts RTCP monitoring in background goroutines.
+// Each RTPSession may be monitored only once and only after remote SDP is parsed.
+// For a forked media session, the predecessor RTPSession's Close must return first.
 func (s *RTPSession) MonitorBackground() error {
 	if s.Sess.Raddr.IP == nil || s.Sess.rtcpRaddr.IP == nil {
 		return fmt.Errorf("raddr of RTP is not present. Is RemoteSDP called. Monitor RTP Session failed")
@@ -474,7 +499,9 @@ func (s *RTPSession) startMonitorUnsafe() error {
 	if s.monitorStarted {
 		return errors.New("RTCP monitor already started")
 	}
-	if err := s.Sess.rtcpConn.SetReadDeadline(time.Time{}); err != nil {
+	// Close expires both directions to release blocked I/O. A successor is the
+	// only session allowed to clear those shared deadlines after Close returns.
+	if err := s.Sess.rtcpConn.SetDeadline(time.Time{}); err != nil {
 		return err
 	}
 
@@ -493,6 +520,12 @@ func (s *RTPSession) beginRTCPIO() bool {
 
 	s.rtcpIOWG.Add(1)
 	return true
+}
+
+func (s *RTPSession) isClosed() bool {
+	s.lifecycleMU.Lock()
+	defer s.lifecycleMU.Unlock()
+	return s.closed
 }
 
 func (s *RTPSession) readRTCP() error {
@@ -624,7 +657,16 @@ func (s *RTPSession) writeRTCP(now time.Time) error {
 		return net.ErrClosed
 	}
 	defer s.rtcpIOWG.Done()
-	return s.Sess.WriteRTCP(pkt)
+	err := s.Sess.WriteRTCP(pkt)
+	if err != nil && s.isClosed() {
+		var netErr net.Error
+		if errors.Is(err, net.ErrClosed) || errors.As(err, &netErr) && netErr.Timeout() {
+			// Close deliberately expires the shared write deadline. Treat that
+			// interruption as lifecycle completion rather than a transport failure.
+			return net.ErrClosed
+		}
+	}
+	return err
 }
 
 func (s *RTPSession) parseReceiverReport(receiverReport *rtcp.ReceiverReport, now time.Time, ssrc uint32) {

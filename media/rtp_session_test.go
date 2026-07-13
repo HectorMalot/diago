@@ -19,26 +19,94 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-type blockingWriter struct {
-	started chan struct{}
-	release <-chan struct{}
-	once    sync.Once
+type deadlineTimeoutError struct{}
+
+func (deadlineTimeoutError) Error() string   { return "I/O timeout" }
+func (deadlineTimeoutError) Timeout() bool   { return true }
+func (deadlineTimeoutError) Temporary() bool { return true }
+
+type deadlineAwarePacketConn struct {
+	mu sync.Mutex
+
+	writeStarted     chan struct{}
+	deadlineExpired  chan struct{}
+	writeStartOnce   sync.Once
+	expireOnce       sync.Once
+	blockFirstWrite  bool
+	writeDeadline    time.Time
+	successfulWrites int
 }
 
-func (w *blockingWriter) Write(p []byte) (int, error) {
-	w.once.Do(func() {
-		close(w.started)
-	})
-	<-w.release
+func newDeadlineAwarePacketConn() *deadlineAwarePacketConn {
+	return &deadlineAwarePacketConn{
+		writeStarted:    make(chan struct{}),
+		deadlineExpired: make(chan struct{}),
+		blockFirstWrite: true,
+	}
+}
+
+func (c *deadlineAwarePacketConn) ReadFrom([]byte) (int, net.Addr, error) {
+	return 0, nil, net.ErrClosed
+}
+
+func (c *deadlineAwarePacketConn) WriteTo(p []byte, _ net.Addr) (int, error) {
+	c.mu.Lock()
+	block := c.blockFirstWrite
+	if block {
+		c.blockFirstWrite = false
+	}
+	deadline := c.writeDeadline
+	c.mu.Unlock()
+
+	if block {
+		c.writeStartOnce.Do(func() { close(c.writeStarted) })
+		<-c.deadlineExpired
+		return 0, deadlineTimeoutError{}
+	}
+	if !deadline.IsZero() && !time.Now().Before(deadline) {
+		return 0, deadlineTimeoutError{}
+	}
+
+	c.mu.Lock()
+	c.successfulWrites++
+	c.mu.Unlock()
 	return len(p), nil
 }
 
-type noDeadlinePacketConn struct {
-	*fakes.UDPConn
+func (c *deadlineAwarePacketConn) Close() error { return nil }
+
+func (c *deadlineAwarePacketConn) LocalAddr() net.Addr {
+	return &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9877}
 }
 
-func (*noDeadlinePacketConn) SetReadDeadline(time.Time) error {
+func (c *deadlineAwarePacketConn) SetDeadline(t time.Time) error {
+	c.mu.Lock()
+	c.writeDeadline = t
+	c.mu.Unlock()
+	if !t.IsZero() && !time.Now().Before(t) {
+		c.expireOnce.Do(func() { close(c.deadlineExpired) })
+	}
 	return nil
+}
+
+func (c *deadlineAwarePacketConn) SetReadDeadline(time.Time) error {
+	return nil
+}
+
+func (c *deadlineAwarePacketConn) SetWriteDeadline(t time.Time) error {
+	c.mu.Lock()
+	c.writeDeadline = t
+	c.mu.Unlock()
+	if !t.IsZero() && !time.Now().Before(t) {
+		c.expireOnce.Do(func() { close(c.deadlineExpired) })
+	}
+	return nil
+}
+
+func (c *deadlineAwarePacketConn) successfulWriteCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.successfulWrites
 }
 
 func fakeSession(lport int, rport int, rtpReader io.Reader, rtpWriter io.Writer, rtcpReader io.Reader, rtcpWriter io.Writer) *RTPSession {
@@ -82,9 +150,12 @@ func pipeRTP(lport int, rport int) (read *RTPSession, write *RTPSession) {
 func useEphemeralRTPPorts(t *testing.T) {
 	t.Helper()
 	portStart, portEnd := RTPPortStart, RTPPortEnd
+	portOffset := rtpPortOffset.Load()
 	RTPPortStart, RTPPortEnd = 0, 0
+	rtpPortOffset.Store(0)
 	t.Cleanup(func() {
 		RTPPortStart, RTPPortEnd = portStart, portEnd
+		rtpPortOffset.Store(portOffset)
 	})
 }
 
@@ -271,14 +342,15 @@ func TestRTPSessionClose(t *testing.T) {
 	require.ErrorIs(t, err, net.ErrClosed)
 }
 
-func TestRTPSessionCloseWaitsForActiveWrite(t *testing.T) {
-	releaseWrite := make(chan struct{})
-	writer := &blockingWriter{
-		started: make(chan struct{}),
-		release: releaseWrite,
+func TestRTPSessionCloseInterruptsActiveWriteAndForkCanWrite(t *testing.T) {
+	conn := newDeadlineAwarePacketConn()
+	mediaSession := &MediaSession{
+		Codecs:    []Codec{CodecAudioAlaw, CodecAudioUlaw},
+		Raddr:     net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1234},
+		rtcpRaddr: net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1235},
+		rtcpConn:  conn,
 	}
-	rtpSession := fakeSession(9876, 1234, nil, io.Discard, nil, writer)
-	rtpSession.Sess.rtcpConn = &noDeadlinePacketConn{UDPConn: rtpSession.Sess.rtcpConn.(*fakes.UDPConn)}
+	rtpSession := NewRTPSession(mediaSession)
 	rtpSession.writeStats = RTPWriteStats{
 		SSRC:                0x12345678,
 		lastPacketTime:      time.Now(),
@@ -293,36 +365,34 @@ func TestRTPSessionCloseWaitsForActiveWrite(t *testing.T) {
 		writeDone <- rtpSession.writeRTCP(time.Now())
 	}()
 	select {
-	case <-writer.started:
+	case <-conn.writeStarted:
 	case <-time.After(time.Second):
 		t.Fatal("RTCP write did not start")
 	}
 
 	closeDone := make(chan error, 1)
-	go func() {
-		closeDone <- rtpSession.Close()
-	}()
+	go func() { closeDone <- rtpSession.Close() }()
 	select {
 	case err := <-closeDone:
-		close(releaseWrite)
 		require.NoError(t, err)
-		t.Fatal("Close returned during active RTCP socket I/O")
-	case <-time.After(50 * time.Millisecond):
+	case <-time.After(time.Second):
+		t.Fatal("Close did not interrupt active RTCP write I/O")
 	}
-
-	close(releaseWrite)
 	select {
 	case err := <-writeDone:
-		require.NoError(t, err)
+		require.ErrorIs(t, err, net.ErrClosed)
 	case <-time.After(time.Second):
-		t.Fatal("RTCP write did not return after it was released")
+		t.Fatal("Close did not interrupt active RTCP socket I/O")
 	}
-	select {
-	case err := <-closeDone:
-		require.NoError(t, err)
-	case <-time.After(time.Second):
-		t.Fatal("Close did not return after RTCP socket I/O completed")
-	}
+
+	nextMedia := mediaSession.Fork()
+	nextMedia.SetRemoteAddr(&mediaSession.Raddr)
+	nextRTP := NewRTPSession(nextMedia)
+	nextRTP.writeStats = rtpSession.writeStats
+	require.NoError(t, nextRTP.MonitorBackground())
+	require.NoError(t, nextRTP.writeRTCP(time.Now()))
+	require.Equal(t, 1, conn.successfulWriteCount())
+	require.NoError(t, nextRTP.Close())
 }
 
 func TestRTPSessionMonitorContinuesAfterFork(t *testing.T) {
@@ -378,6 +448,81 @@ func TestRTPSessionMonitorContinuesAfterFork(t *testing.T) {
 	}
 
 	require.NoError(t, currentRTP.Close())
+}
+
+func TestRTPSessionForegroundMonitorDoesNotPoisonFork(t *testing.T) {
+	useEphemeralRTPPorts(t)
+	local, err := NewMediaSession(net.IPv4(127, 0, 0, 1), 0)
+	require.NoError(t, err)
+	remote, err := NewMediaSession(net.IPv4(127, 0, 0, 1), 0)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, local.Close())
+		require.NoError(t, remote.Close())
+	})
+
+	local.SetRemoteAddr(&remote.Laddr)
+	retiredRTP := NewRTPSession(local)
+	retiredRTP.rtcpTicker.Stop()
+	retiredRTP.rtcpTicker = time.NewTicker(10 * time.Millisecond)
+	callbackStarted := make(chan struct{})
+	releaseCallback := make(chan struct{})
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(releaseCallback) }) })
+	retiredRTP.OnWriteRTCP(func(rtcp.Packet, RTPWriteStats) {
+		close(callbackStarted)
+		<-releaseCallback
+	})
+	pkt := &rtp.Packet{
+		Header: rtp.Header{
+			Version:     2,
+			PayloadType: CodecAudioAlaw.PayloadType,
+			Timestamp:   160,
+			SSRC:        0x12345678,
+		},
+		Payload: make([]byte, 160),
+	}
+	require.NoError(t, retiredRTP.WriteRTP(pkt))
+
+	monitorDone := make(chan error, 1)
+	go func() { monitorDone <- retiredRTP.Monitor() }()
+	select {
+	case <-callbackStarted:
+	case <-time.After(time.Second):
+		t.Fatal("foreground RTCP writer callback did not start")
+	}
+
+	// The callback is outside the socket-I/O barrier, so Close can retire this
+	// session while the foreground Monitor is still unwinding its writer path.
+	require.NoError(t, retiredRTP.Close())
+	nextMedia := local.Fork()
+	nextMedia.SetRemoteAddr(&remote.Laddr)
+	nextRTP := NewRTPSession(nextMedia)
+	reportReceived := make(chan struct{})
+	var reportOnce sync.Once
+	nextRTP.OnReadRTCP(func(rtcp.Packet, RTPReadStats) {
+		reportOnce.Do(func() { close(reportReceived) })
+	})
+	require.NoError(t, nextRTP.MonitorBackground())
+
+	releaseOnce.Do(func() { close(releaseCallback) })
+	select {
+	case err := <-monitorDone:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("foreground Monitor did not finish after Close")
+	}
+
+	report, err := (&rtcp.ReceiverReport{SSRC: 0x87654321}).Marshal()
+	require.NoError(t, err)
+	_, err = remote.rtcpConn.WriteTo(report, nextMedia.rtcpConn.LocalAddr())
+	require.NoError(t, err)
+	select {
+	case <-reportReceived:
+	case <-time.After(time.Second):
+		t.Fatal("retired foreground Monitor poisoned the fork's RTCP reader deadline")
+	}
+	require.NoError(t, nextRTP.Close())
 }
 
 func TestRTPSessionCloseDoesNotWaitForCallback(t *testing.T) {
