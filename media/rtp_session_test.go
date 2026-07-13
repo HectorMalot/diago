@@ -55,6 +55,15 @@ func pipeRTP(lport int, rport int) (read *RTPSession, write *RTPSession) {
 	return rtpSessRead, rtpSessWrite
 }
 
+func useEphemeralRTPPorts(t *testing.T) {
+	t.Helper()
+	portStart, portEnd := RTPPortStart, RTPPortEnd
+	RTPPortStart, RTPPortEnd = 0, 0
+	t.Cleanup(func() {
+		RTPPortStart, RTPPortEnd = portStart, portEnd
+	})
+}
+
 func TestRTPSessionReading(t *testing.T) {
 	// pipeRTP := bytes.NewBuffer([]byte{})
 
@@ -239,6 +248,112 @@ func TestRTPSessionClose(t *testing.T) {
 	neterr, ok := err.(net.Error)
 	require.True(t, ok)
 	require.True(t, neterr.Timeout())
+}
+
+func TestRTPSessionMonitorContinuesAfterFork(t *testing.T) {
+	useEphemeralRTPPorts(t)
+	local, err := NewMediaSession(net.IPv4(127, 0, 0, 1), 0)
+	require.NoError(t, err)
+	remote, err := NewMediaSession(net.IPv4(127, 0, 0, 1), 0)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, local.Close())
+		require.NoError(t, remote.Close())
+	})
+
+	local.SetRemoteAddr(&remote.Laddr)
+	currentMedia := local
+	currentRTP := NewRTPSession(currentMedia)
+	require.NoError(t, currentRTP.MonitorBackground())
+
+	for i := range 2 {
+		nextMedia := currentMedia.Fork()
+		nextMedia.SetRemoteAddr(&remote.Laddr)
+		retiredRTP := currentRTP
+		require.NoError(t, retiredRTP.Close())
+
+		nextRTP := NewRTPSession(nextMedia)
+		nextRTP.rtcpTicker.Stop()
+		nextRTP.rtcpTicker = time.NewTicker(10 * time.Millisecond)
+		require.NoError(t, nextRTP.MonitorBackground())
+		require.NoError(t, retiredRTP.Close())
+
+		pkt := &rtp.Packet{
+			Header: rtp.Header{
+				Version:        2,
+				PayloadType:    CodecAudioAlaw.PayloadType,
+				SequenceNumber: uint16(i + 1),
+				Timestamp:      uint32((i + 1) * 160),
+				SSRC:           0x12345678,
+			},
+			Payload: make([]byte, 160),
+		}
+		require.NoError(t, nextRTP.WriteRTP(pkt))
+
+		require.NoError(t, remote.rtcpConn.SetReadDeadline(time.Now().Add(time.Second)))
+		buf := make([]byte, 1600)
+		n, _, err := remote.rtcpConn.ReadFrom(buf)
+		require.NoErrorf(t, err, "fork %d did not produce RTCP", i+1)
+		packets, err := rtcp.Unmarshal(buf[:n])
+		require.NoError(t, err)
+		require.IsType(t, &rtcp.SenderReport{}, packets[0])
+
+		currentMedia = nextMedia
+		currentRTP = nextRTP
+	}
+
+	require.NoError(t, currentRTP.Close())
+}
+
+func TestRTPSessionCloseWaitsForMonitor(t *testing.T) {
+	useEphemeralRTPPorts(t)
+	local, err := NewMediaSession(net.IPv4(127, 0, 0, 1), 0)
+	require.NoError(t, err)
+	remote, err := NewMediaSession(net.IPv4(127, 0, 0, 1), 0)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, local.Close())
+		require.NoError(t, remote.Close())
+	})
+
+	local.SetRemoteAddr(&remote.Laddr)
+	rtpSession := NewRTPSession(local)
+	callbackStarted := make(chan struct{})
+	releaseCallback := make(chan struct{})
+	rtpSession.OnReadRTCP(func(rtcp.Packet, RTPReadStats) {
+		close(callbackStarted)
+		<-releaseCallback
+	})
+	require.NoError(t, rtpSession.MonitorBackground())
+
+	report, err := (&rtcp.ReceiverReport{SSRC: 0x87654321}).Marshal()
+	require.NoError(t, err)
+	_, err = remote.rtcpConn.WriteTo(report, local.rtcpConn.LocalAddr())
+	require.NoError(t, err)
+	select {
+	case <-callbackStarted:
+	case <-time.After(time.Second):
+		t.Fatal("RTCP callback did not start")
+	}
+
+	closeDone := make(chan error, 1)
+	go func() {
+		closeDone <- rtpSession.Close()
+	}()
+	select {
+	case err := <-closeDone:
+		require.NoError(t, err)
+		t.Fatal("Close returned before the RTCP monitor exited")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(releaseCallback)
+	select {
+	case err := <-closeDone:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("Close did not return after the RTCP monitor exited")
+	}
 }
 
 func TestRTTCalc(t *testing.T) {

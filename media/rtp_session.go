@@ -45,10 +45,17 @@ type RTPSession struct {
 	// Keep pointers at top to reduce GC
 	Sess *MediaSession
 
+	lifecycleMU    sync.Mutex
+	rtcpTicker     *time.Ticker
+	rtcpClosed     chan struct{}
+	monitorWG      sync.WaitGroup
+	monitorStarted bool
+	closed         bool
+	closeOnce      sync.Once
+	closeErr       error
+
 	rtcpMU sync.Mutex
-	// All below fields should not be updated without rtcpMu Lock
-	rtcpTicker *time.Ticker
-	rtcpClosed chan struct{}
+	// All below fields should not be updated without rtcpMU Lock
 	readStats  RTPReadStats
 	writeStats RTPWriteStats
 
@@ -56,8 +63,6 @@ type RTPSession struct {
 	// Must be set before RTP is read or writen
 	onReadRTCP  func(pkt rtcp.Packet, rtpStats RTPReadStats)
 	onWriteRTCP func(pkt rtcp.Packet, rtpStats RTPWriteStats)
-
-	closed bool
 
 	// sourceLock when enabled locks reading RTP packets into single source addr which handles security issue
 	sourceLock        bool
@@ -157,19 +162,20 @@ func NewRTPSession(sess *MediaSession) *RTPSession {
 }
 
 func (s *RTPSession) Close() error {
-	s.rtcpMU.Lock()
-	closed := s.closed
-	s.closed = true
-	s.rtcpMU.Unlock()
-
-	// Stop monitor routing
-	if !closed {
+	s.closeOnce.Do(func() {
+		s.lifecycleMU.Lock()
+		s.closed = true
 		close(s.rtcpClosed)
-	}
-	// Below is safe to call again
-	s.rtcpTicker.Stop()
-	err := s.Sess.rtcpConn.SetDeadline(time.Now())
-	return err
+		s.rtcpTicker.Stop()
+		conn := s.Sess.rtcpConn
+		s.lifecycleMU.Unlock()
+
+		if conn != nil {
+			s.closeErr = conn.SetReadDeadline(time.Now())
+		}
+		s.monitorWG.Wait()
+	})
+	return s.closeErr
 }
 
 func (s *RTPSession) OnReadRTCP(f func(pkt rtcp.Packet, rtpStats RTPReadStats)) {
@@ -373,11 +379,19 @@ func (s *RTPSession) Monitor() error {
 		return fmt.Errorf("raddr of RTP is not present. You must call this after RemoteSDP is parsed")
 	}
 
-	errchan := make(chan error)
+	errchan := make(chan error, 1)
+	s.lifecycleMU.Lock()
+	if err := s.startMonitorUnsafe(); err != nil {
+		s.lifecycleMU.Unlock()
+		return err
+	}
 	go func() {
+		defer s.monitorWG.Done()
 		errchan <- s.readRTCP()
 	}()
+	s.lifecycleMU.Unlock()
 
+	defer s.monitorWG.Done()
 	var err error
 	for {
 		var now time.Time
@@ -391,6 +405,9 @@ func (s *RTPSession) Monitor() error {
 			break
 		}
 	}
+	if deadlineErr := s.Sess.rtcpConn.SetReadDeadline(time.Now()); deadlineErr != nil {
+		err = errors.Join(err, deadlineErr)
+	}
 	return errors.Join(err, <-errchan)
 }
 
@@ -402,7 +419,13 @@ func (s *RTPSession) MonitorBackground() error {
 	}
 
 	log := DefaultLogger()
+	s.lifecycleMU.Lock()
+	if err := s.startMonitorUnsafe(); err != nil {
+		s.lifecycleMU.Unlock()
+		return err
+	}
 	go func() {
+		defer s.monitorWG.Done()
 		sess := s.Sess
 		log.Debug("RTCP reader started", "laddr", sess.rtcpConn.LocalAddr().String())
 		if err := s.readRTCP(); err != nil {
@@ -422,6 +445,7 @@ func (s *RTPSession) MonitorBackground() error {
 	}()
 
 	go func() {
+		defer s.monitorWG.Done()
 		sess := s.Sess
 		log.Debug("RTCP writer started", "raddr", sess.rtcpRaddr.String())
 		for {
@@ -443,6 +467,23 @@ func (s *RTPSession) MonitorBackground() error {
 			}
 		}
 	}()
+	s.lifecycleMU.Unlock()
+	return nil
+}
+
+func (s *RTPSession) startMonitorUnsafe() error {
+	if s.closed {
+		return net.ErrClosed
+	}
+	if s.monitorStarted {
+		return errors.New("RTCP monitor already started")
+	}
+	if err := s.Sess.rtcpConn.SetReadDeadline(time.Time{}); err != nil {
+		return err
+	}
+
+	s.monitorStarted = true
+	s.monitorWG.Add(2)
 	return nil
 }
 
@@ -450,8 +491,7 @@ func (s *RTPSession) readRTCP() error {
 	sess := s.Sess
 	// TODO use sync pool here
 	buf := make([]byte, 1600)
-	rtcpBuf := make([]rtcp.Packet, 5)          // What would be more correct value?
-	sess.rtcpConn.SetReadDeadline(time.Time{}) // For now make sure we are not getting timeout
+	rtcpBuf := make([]rtcp.Packet, 5) // What would be more correct value?
 	for {
 		n, err := sess.ReadRTCP(buf, rtcpBuf)
 		if err != nil {
