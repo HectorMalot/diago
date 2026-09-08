@@ -44,6 +44,11 @@ func (m *pcmBufioWriter) Flush() error {
 }
 
 func (m *pcmBufioWriter) writeSilenceUnsafe(now time.Time) error {
+	// A concurrent flush may advance lastTime after a sample timestamp was captured.
+	if !now.After(m.lastTime) {
+		return nil
+	}
+
 	diff := uint32(now.Sub(m.lastTime).Seconds() * float64(m.codec.SampleRate))
 	srt := m.codec.SampleTimestamp()
 	for i := 2 * srt; i < diff; i += srt {
