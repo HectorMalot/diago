@@ -48,12 +48,17 @@ type RTPSession struct {
 	// Keep pointers at top to reduce GC
 	Sess *MediaSession
 
+	lifecycleMU    sync.Mutex
+	rtcpTicker     *time.Ticker
+	rtcpClosed     chan struct{}
+	rtcpIOWG       sync.WaitGroup
+	monitorStarted bool
+	closed         bool
+	closeOnce      sync.Once
+	closeErr       error
+
 	rtcpMU sync.Mutex
-	// All below fields should not be updated without rtcpMu Lock
-	rtcpTicker *time.Ticker
-	rtcpClosed chan struct{}
-	monitorWG  sync.WaitGroup
-	monitorRun bool
+	// All below fields should not be updated without rtcpMU Lock
 	readStats  RTPReadStats
 	writeStats RTPWriteStats
 
@@ -61,8 +66,6 @@ type RTPSession struct {
 	// Must be set before RTP is read or writen
 	onReadRTCP  func(pkt rtcp.Packet, rtpStats RTPReadStats)
 	onWriteRTCP func(pkt rtcp.Packet, rtpStats RTPWriteStats)
-
-	closed bool
 
 	// sourceLock when enabled locks reading RTP packets into single source addr which handles security issue
 	sourceLock        bool
@@ -196,32 +199,34 @@ func (s *RTPSession) Fork(sess *MediaSession) *RTPSession {
 	return fork
 }
 
-func (s *RTPSession) close(wait bool) error {
-	s.rtcpMU.Lock()
-	closed := s.closed
-	s.closed = true
-	if !closed {
-		close(s.rtcpClosed)
-	}
-	s.rtcpTicker.Stop()
-	rtcpConn := s.Sess.rtcpConn
-	s.rtcpMU.Unlock()
-
-	err := rtcpConn.SetDeadline(time.Now())
-	if wait {
-		s.monitorWG.Wait()
-	}
-	return err
-}
-
-// MonitorClose stops RTCP monitoring and waits until all monitor goroutines
-// have exited. The RTP/RTCP connections remain open for a replacement fork.
+// MonitorClose stops RTCP monitoring and waits for active socket I/O to return.
+// Callbacks are not waited for because they may close the session or enter dialog
+// locks. The RTP/RTCP connections remain open for a replacement fork.
 func (s *RTPSession) MonitorClose() error {
-	return s.close(true)
+	return s.Close()
 }
 
+// Close stops RTCP monitoring and waits for active socket I/O to return.
+// Callbacks may call Close because callback execution is not part of that wait.
+// If the media session has been forked, Close must return before monitoring starts
+// on the successor because both sessions share the same packet connections.
 func (s *RTPSession) Close() error {
-	return s.close(false)
+	s.closeOnce.Do(func() {
+		s.lifecycleMU.Lock()
+		s.closed = true
+		close(s.rtcpClosed)
+		s.rtcpTicker.Stop()
+		conn := s.Sess.rtcpConn
+		if conn != nil {
+			// Forked sessions share this connection. Interrupt all blocked I/O so the
+			// predecessor is quiescent before a successor clears the deadline.
+			s.closeErr = conn.SetDeadline(time.Now())
+		}
+		s.lifecycleMU.Unlock()
+
+		s.rtcpIOWG.Wait()
+	})
+	return s.closeErr
 }
 
 func (s *RTPSession) OnReadRTCP(f func(pkt rtcp.Packet, rtpStats RTPReadStats)) {
@@ -234,21 +239,6 @@ func (s *RTPSession) OnWriteRTCP(f func(pkt rtcp.Packet, rtpStats RTPWriteStats)
 	s.rtcpMU.Lock()
 	defer s.rtcpMU.Unlock()
 	s.onWriteRTCP = f
-}
-
-func (s *RTPSession) startMonitor(goroutines int) error {
-	s.rtcpMU.Lock()
-	defer s.rtcpMU.Unlock()
-
-	if s.monitorRun {
-		return errRTPSessionMonitorStarted
-	}
-	if s.closed {
-		return errRTPSessionClosed
-	}
-	s.monitorRun = true
-	s.monitorWG.Add(goroutines)
-	return nil
 }
 
 // ReadRTP reads RTP
@@ -441,21 +431,23 @@ func (s *RTPSession) WriteStats() RTPWriteStats {
 	return s.writeStats
 }
 
-// Monitor starts reading RTCP and monitoring media quality
+// Monitor starts RTCP monitoring in the caller's goroutine.
+// A predecessor sharing the media connections must finish MonitorClose first.
 func (s *RTPSession) Monitor() error {
-	sess := s.Sess
-	if sess.Raddr.IP == nil || sess.rtcpRaddr.IP == nil {
+	if s.Sess.Raddr.IP == nil || s.Sess.rtcpRaddr.IP == nil {
 		return fmt.Errorf("raddr of RTP is not present. You must call this after RemoteSDP is parsed")
 	}
-	if err := s.startMonitor(1); err != nil {
+
+	errchan := make(chan error, 1)
+	s.lifecycleMU.Lock()
+	if err := s.startMonitorUnsafe(); err != nil {
+		s.lifecycleMU.Unlock()
 		return err
 	}
-
-	errchan := make(chan error)
 	go func() {
-		defer s.monitorWG.Done()
 		errchan <- s.readRTCP()
 	}()
+	s.lifecycleMU.Unlock()
 
 	var err error
 	for {
@@ -470,24 +462,43 @@ func (s *RTPSession) Monitor() error {
 			break
 		}
 	}
-	return errors.Join(err, <-errchan)
+	s.lifecycleMU.Lock()
+	closed := s.closed
+	if !closed {
+		// The reader needs a wake-up when the writer fails, but a retired session
+		// must never overwrite the deadline cleared by its forked successor.
+		if deadlineErr := s.Sess.rtcpConn.SetReadDeadline(time.Now()); deadlineErr != nil {
+			err = errors.Join(err, deadlineErr)
+		}
+	}
+	s.lifecycleMU.Unlock()
+
+	readErr := <-errchan
+	if closed && errors.Is(err, net.ErrClosed) {
+		var netErr net.Error
+		if errors.Is(readErr, io.EOF) || errors.Is(readErr, net.ErrClosed) ||
+			errors.As(readErr, &netErr) && netErr.Timeout() {
+			return nil
+		}
+	}
+	return errors.Join(err, readErr)
 }
 
-// MonitorBackground is helper to keep monitoring in background
-// MUST Be called after session REMOTE SDP is parsed
+// MonitorBackground starts RTCP monitoring after remote SDP is parsed.
+// A predecessor sharing the media connections must finish MonitorClose first.
 func (s *RTPSession) MonitorBackground() error {
-	sess := s.Sess
-	if sess.Raddr.IP == nil || sess.rtcpRaddr.IP == nil {
+	if s.Sess.Raddr.IP == nil || s.Sess.rtcpRaddr.IP == nil {
 		return fmt.Errorf("raddr of RTP is not present. Is RemoteSDP called. Monitor RTP Session failed")
 	}
 
-	if err := s.startMonitor(2); err != nil {
+	log := DefaultLogger()
+	s.lifecycleMU.Lock()
+	if err := s.startMonitorUnsafe(); err != nil {
+		s.lifecycleMU.Unlock()
 		return err
 	}
-
-	log := DefaultLogger()
 	go func() {
-		defer s.monitorWG.Done()
+		sess := s.Sess
 		log.Debug("RTCP reader started", "laddr", sess.rtcpConn.LocalAddr().String())
 		if err := s.readRTCP(); err != nil {
 			if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
@@ -506,7 +517,7 @@ func (s *RTPSession) MonitorBackground() error {
 	}()
 
 	go func() {
-		defer s.monitorWG.Done()
+		sess := s.Sess
 		log.Debug("RTCP writer started", "raddr", sess.rtcpRaddr.String())
 		for {
 			var now time.Time
@@ -527,7 +538,44 @@ func (s *RTPSession) MonitorBackground() error {
 			}
 		}
 	}()
+	s.lifecycleMU.Unlock()
 	return nil
+}
+
+func (s *RTPSession) startMonitorUnsafe() error {
+	if s.closed {
+		return errRTPSessionClosed
+	}
+	if s.monitorStarted {
+		return errRTPSessionMonitorStarted
+	}
+	// Close expires both directions to release blocked I/O. A successor is the
+	// only session allowed to clear those shared deadlines after Close returns.
+	if err := s.Sess.rtcpConn.SetDeadline(time.Time{}); err != nil {
+		return err
+	}
+
+	s.monitorStarted = true
+	return nil
+}
+
+// Callbacks intentionally run outside this barrier because they may close the session or enter dialog locks.
+// Close only needs the shared socket to be idle before its connection can be handed to a replacement session.
+func (s *RTPSession) beginRTCPIO() bool {
+	s.lifecycleMU.Lock()
+	defer s.lifecycleMU.Unlock()
+	if s.closed {
+		return false
+	}
+
+	s.rtcpIOWG.Add(1)
+	return true
+}
+
+func (s *RTPSession) isClosed() bool {
+	s.lifecycleMU.Lock()
+	defer s.lifecycleMU.Unlock()
+	return s.closed
 }
 
 func (s *RTPSession) readRTCP() error {
@@ -535,22 +583,12 @@ func (s *RTPSession) readRTCP() error {
 	// TODO use sync pool here
 	buf := make([]byte, 1600)
 	rtcpBuf := make([]rtcp.Packet, 5) // What would be more correct value?
-
-	// Serialize clearing the read deadline with MonitorClose. Otherwise a
-	// monitor goroutine that starts late could clear the deadline after the
-	// stop signal and block forever on the shared RTCP connection.
-	s.rtcpMU.Lock()
-	var err error
-	if !s.closed {
-		err = sess.rtcpConn.SetReadDeadline(time.Time{}) // For now make sure we are not getting timeout
-	}
-	s.rtcpMU.Unlock()
-	if err != nil {
-		return err
-	}
-
 	for {
+		if !s.beginRTCPIO() {
+			return net.ErrClosed
+		}
 		n, err := sess.ReadRTCP(buf, rtcpBuf)
+		s.rtcpIOWG.Done()
 		if err != nil {
 			if errors.Is(err, errRTCPFailedToUnmarshal) {
 				DefaultLogger().Error("RTCP Unmarshal error. Continue listen", "error", err)
@@ -570,10 +608,11 @@ func (s *RTPSession) readRTCPPacket(pkt rtcp.Packet) {
 	now := time.Now()
 
 	// Add interceptor
-	if s.onReadRTCP != nil {
+	onReadRTCP := s.onReadRTCP
+	if onReadRTCP != nil {
 		stats := s.readStats
 		s.rtcpMU.Unlock()
-		s.onReadRTCP(pkt, stats)
+		onReadRTCP(pkt, stats)
 		s.rtcpMU.Lock()
 	}
 
@@ -622,14 +661,13 @@ func (s *RTPSession) readReceptionReport(rr rtcp.ReceptionReport, now time.Time)
 }
 
 func (s *RTPSession) writeRTCP(now time.Time) error {
-	sess := s.Sess
 
 	var pkt rtcp.Packet
 
 	// If there is no writer in session (a=recvonly) then generate only receiver report
 	// otherwise always go with sender report with reception reports
 	s.rtcpMU.Lock()
-	if sess.Mode == sdp.ModeRecvonly {
+	if s.Sess.Mode == sdp.ModeRecvonly {
 		if s.readStats.SSRC == 0 {
 			s.rtcpMU.Unlock()
 			return nil
@@ -656,15 +694,29 @@ func (s *RTPSession) writeRTCP(now time.Time) error {
 	s.readStats.IntervalPacketsCount = 0
 
 	// Add interceptor
-	if s.onWriteRTCP != nil {
+	onWriteRTCP := s.onWriteRTCP
+	if onWriteRTCP != nil {
 		stats := s.writeStats
 		s.rtcpMU.Unlock()
-		s.onWriteRTCP(pkt, stats)
+		onWriteRTCP(pkt, stats)
 	} else {
 		s.rtcpMU.Unlock()
 	}
 
-	return sess.WriteRTCP(pkt)
+	if !s.beginRTCPIO() {
+		return net.ErrClosed
+	}
+	defer s.rtcpIOWG.Done()
+	err := s.Sess.WriteRTCP(pkt)
+	if err != nil && s.isClosed() {
+		var netErr net.Error
+		if errors.Is(err, net.ErrClosed) || errors.As(err, &netErr) && netErr.Timeout() {
+			// Close deliberately expires the shared write deadline. Treat that
+			// interruption as lifecycle completion rather than a transport failure.
+			return net.ErrClosed
+		}
+	}
+	return err
 }
 
 func (s *RTPSession) parseReceiverReport(receiverReport *rtcp.ReceiverReport, now time.Time, ssrc uint32) {

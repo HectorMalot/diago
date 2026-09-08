@@ -260,14 +260,14 @@ func (d *DialogMedia) mediaUpdateUnsafe(msess *media.MediaSession) error {
 }
 
 // replaceRTPSessionUnsafe replaces the RTP session after the old monitor has
-// fully stopped. A fork preserves statistics and shared connections; a new
+// stopped using the shared sockets. A fork preserves statistics and shared connections; a new
 // session is used when media connections were recreated.
 func (d *DialogMedia) replaceRTPSessionUnsafe(msess *media.MediaSession) error {
 	oldRTPSess := d.rtpSession
 	if oldRTPSess == nil {
 		return fmt.Errorf("RTP Session is nil while trying to update it")
 	}
-	// This will block until read  RTCP is closed fully, which we need before starting new one
+	// Retire socket I/O before the successor clears the shared RTCP deadlines.
 	if err := oldRTPSess.MonitorClose(); err != nil {
 		return err
 	}
