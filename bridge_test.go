@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"net"
 	"testing"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 	"github.com/emiago/diago/media"
 	"github.com/emiago/sipgo"
 	"github.com/emiago/sipgo/sip"
+	"github.com/pion/rtp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -67,6 +69,51 @@ func TestBridgeProxy(t *testing.T) {
 	// Confirm all data is proxied
 	assert.Equal(t, 9999, incoming.audioWriter.(*bytes.Buffer).Len())
 	assert.Equal(t, 9999, outgoing.audioWriter.(*bytes.Buffer).Len())
+}
+
+func TestBridgeExplicitProxyMediaClearsWriteDeadlines(t *testing.T) {
+	codec := media.CodecAudioAlaw
+	payload := bytes.Repeat([]byte{0x55}, 160)
+	peers := make([]net.PacketConn, 2)
+	dialogs := []DialogSession{&DialogServerSession{}, &DialogClientSession{}}
+	for i := range dialogs {
+		conn, err := net.ListenPacket("udp", "127.0.0.1:0")
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, conn.Close()) })
+		peer, err := net.ListenPacket("udp", "127.0.0.1:0")
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, peer.Close()) })
+		peers[i] = peer
+
+		sess := &media.MediaSession{Codecs: []media.Codec{codec}}
+		sess.InitWithListeners(conn, conn, peer.LocalAddr().(*net.UDPAddr))
+		require.NoError(t, sess.StopRTP(2, 0))
+		writer := media.NewRTPPacketWriter(sess, codec)
+		t.Cleanup(writer.ClockDisable)
+		*dialogs[i].Media() = DialogMedia{
+			mediaSession:    sess,
+			audioReader:     bytes.NewReader(payload),
+			audioWriter:     writer,
+			RTPPacketReader: media.NewRTPPacketReader(sess, codec),
+			RTPPacketWriter: writer,
+		}
+	}
+
+	bridge := NewBridge()
+	bridge.WaitDialogsNum = 3 // Keep the two-leg bridge under explicit control.
+	require.NoError(t, bridge.AddDialogSession(dialogs[0]))
+	require.NoError(t, bridge.AddDialogSession(dialogs[1]))
+	require.ErrorIs(t, bridge.ProxyMedia(), io.EOF)
+
+	for _, peer := range peers {
+		require.NoError(t, peer.SetReadDeadline(time.Now().Add(time.Second)))
+		buf := make([]byte, media.RTPBufSize)
+		n, _, err := peer.ReadFrom(buf)
+		require.NoError(t, err)
+		var pkt rtp.Packet
+		require.NoError(t, pkt.Unmarshal(buf[:n]))
+		require.Equal(t, payload, pkt.Payload)
+	}
 }
 
 func TestBridgeNoTranscodingAllowed(t *testing.T) {
