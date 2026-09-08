@@ -11,6 +11,7 @@ import (
 
 	"github.com/emiago/sipgo/fakes"
 	"github.com/pion/rtp"
+	"github.com/pion/srtp/v3"
 	"github.com/stretchr/testify/require"
 )
 
@@ -63,6 +64,79 @@ func TestRTPReader(t *testing.T) {
 		require.Equal(t, len(payload), n)
 		require.Equal(t, rtpReader.seqReader.ReadExtendedSeq(), uint64(writePkt.SequenceNumber))
 	}
+}
+
+// TestRTPReaderSRTPWithExtension is a regression test for SRTP DTMF handling.
+// Telephone-event (DTMF) packets carry an RTP header extension. The optimized
+// SRTP unmarshal path used to strip the extension from the parsed header AFTER
+// slicing the payload at the with-extension offset. That made the reader's
+// payload-size invariant (rtpN - Header.MarshalSize() - PaddingSize == len(Payload))
+// disagree by the extension length and panic, so the packet was dropped and the
+// DTMF digit never reached the application.
+func TestRTPReaderSRTPWithExtension(t *testing.T) {
+	profile := srtp.ProtectionProfile(SRTPProfileAes128CmHmacSha1_80)
+	keyLen, err := profile.KeyLen()
+	require.NoError(t, err)
+	saltLen, err := profile.SaltLen()
+	require.NoError(t, err)
+
+	masterKey := make([]byte, keyLen)
+	masterSalt := make([]byte, saltLen)
+	for i := range masterKey {
+		masterKey[i] = byte(i + 1)
+	}
+	for i := range masterSalt {
+		masterSalt[i] = byte(i + 100)
+	}
+
+	// Two contexts created from the same keying material: one encrypts (peer),
+	// one decrypts (us), mirroring a negotiated SRTP session deterministically.
+	encCtx, err := srtp.CreateContext(masterKey, masterSalt, profile)
+	require.NoError(t, err)
+	decCtx, err := srtp.CreateContext(masterKey, masterSalt, profile)
+	require.NoError(t, err)
+
+	// Payload resembling an RFC 4733 telephone-event (DTMF) frame.
+	payload := []byte{0x05, 0x0a, 0x01, 0xf4}
+	writePkt := rtp.Packet{
+		Header: rtp.Header{
+			Version:        2,
+			PayloadType:    101,
+			SequenceNumber: 4242,
+			Timestamp:      160000,
+			SSRC:           0xdeadbeef,
+			Marker:         true,
+		},
+		Payload: payload,
+	}
+	writePkt.Header.Extension = true
+	writePkt.Header.ExtensionProfile = 0xBEDE
+	require.NoError(t, writePkt.Header.SetExtension(1, []byte{0xAA, 0xBB}))
+
+	raw, err := writePkt.Marshal()
+	require.NoError(t, err)
+
+	encrypted, err := encCtx.EncryptRTP(nil, raw, nil)
+	require.NoError(t, err)
+
+	sess := fakeMediaSessionReader(0, bytes.NewBuffer(encrypted))
+	sess.remoteCtxSRTP = decCtx
+
+	reader := newRTPPacketReaderMedia(sess)
+	buf := make([]byte, RTPBufSize)
+
+	// Before the fix this panicked ("payload calc do not match").
+	n, err := reader.Read(buf)
+	require.NoError(t, err)
+	require.Equal(t, len(payload), n)
+	require.Equal(t, payload, buf[:n])
+
+	hdr := reader.PacketHeader
+	require.Equal(t, writePkt.PayloadType, hdr.PayloadType)
+	require.Equal(t, writePkt.SSRC, hdr.SSRC)
+	require.True(t, hdr.Marker)
+	// The extension is preserved (consistent with the plain-RTP unmarshal path).
+	require.True(t, hdr.Extension)
 }
 
 func BenchmarkRTPPacketReader(b *testing.B) {
