@@ -848,7 +848,9 @@ func TestRTPSessionSourceLockProtection(t *testing.T) {
 	rtpSessRead, rtpSessWrite := pipeRTP(9876, 1234)
 	rtpSessRead.sourceLock = true // Enable source locking
 
+	writeDone := make(chan struct{})
 	go func() {
+		defer close(writeDone)
 		var seq uint16 = 1
 		for ; seq < 5; seq++ {
 			pkt := rtp.Packet{
@@ -865,6 +867,7 @@ func TestRTPSessionSourceLockProtection(t *testing.T) {
 	pkt := rtp.Packet{}
 	_, err := rtpSessRead.ReadRTP(make([]byte, 1600), &pkt)
 	require.NoError(t, err)
+	<-writeDone
 
 	assert.Equal(t, uint16(4), pkt.SequenceNumber)
 }
