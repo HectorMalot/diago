@@ -58,3 +58,31 @@ a=rtcp-mux
 	require.Equal(t, net.ParseIP("192.168.100.11").String(), ci.IP.String())
 
 }
+
+func TestConnectionInformation(t *testing.T) {
+	for _, value := range []string{"", " \t", "IN", "IN IP4", "IN\tIP6"} {
+		t.Run("invalid_"+value, func(t *testing.T) {
+			sd := SessionDescription{"c": {value}}
+			_, err := sd.ConnectionInformation()
+			require.Error(t, err)
+		})
+	}
+	for _, value := range []string{"IN IP4 127.0.0.1", "IN\tIP6\t::1", "IN IP4 224.2.1.1/127/3"} {
+		t.Run(value, func(t *testing.T) {
+			sd := SessionDescription{"c": {value}}
+			ci, err := sd.ConnectionInformation()
+			require.NoError(t, err)
+			require.NotNil(t, ci.IP)
+		})
+	}
+}
+
+func TestUnmarshalBlankLines(t *testing.T) {
+	for _, newline := range []string{"\n", "\r\n"} {
+		sd := SessionDescription{}
+		require.NoError(t, Unmarshal([]byte(newline+"c=IN IP4 127.0.0.1"+newline+newline), &sd))
+		ci, err := sd.ConnectionInformation()
+		require.NoError(t, err)
+		require.Equal(t, net.ParseIP("127.0.0.1"), ci.IP.To16())
+	}
+}

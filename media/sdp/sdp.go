@@ -127,6 +127,9 @@ func (sd SessionDescription) ConnectionInformation() (ci ConnectionInformation, 
 		return ci, fmt.Errorf("Connection information does not exists")
 	}
 	fields := strings.Fields(v)
+	if len(fields) < 3 {
+		return ci, fmt.Errorf("Not enough fields in connection information")
+	}
 	ci.NetworkType = fields[0]
 	ci.AddressType = fields[1]
 	addr := strings.Split(fields[2], "/")
@@ -252,7 +255,7 @@ func nextLine(reader *bytes.Buffer) (line string, err error) {
 	lenline := len(line)
 
 	// Be tolerant for CRLF
-	if line[lenline-2] == '\r' {
+	if lenline >= 2 && line[lenline-2] == '\r' {
 		return line[:lenline-2], nil
 	}
 
