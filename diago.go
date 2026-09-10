@@ -722,10 +722,10 @@ func (dg *Diago) contactHDRFromTransport(tran *Transport, contact *sip.ContactHe
 		UriParams: sip.NewParams(),
 		Headers:   sip.NewParams(),
 	}
-	// Transport should be reflected in contact.
-	// Set this only if we are using same as bind host, as external network could be different
-	// Example TLS termination. External is TLS and this is TCP
-	if tran.ExternalHost == tran.BindHost {
+	// A SIP URI on a TLS listener needs an explicit transport even when the
+	// advertised host differs. Keep the host guard for other transports: a
+	// plaintext listener may sit behind a TLS-terminating proxy.
+	if tran.ExternalHost == tran.BindHost || (tran.Transport == "tls" && scheme == "sip") {
 		contact.Address.UriParams.Add("transport", tran.Transport)
 	}
 }
